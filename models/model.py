@@ -4,6 +4,10 @@ import torch.nn.functional as F
 from .module import *
 
 import ipdb
+from PIL import Image
+import numpy as np
+import torchvision
+import os
 
 
 # 1. basic feature extraction
@@ -44,6 +48,7 @@ class CostVolume(nn.Module):
       # Note that the affine transformation is performed on COORDINATES rather than feaature VALUES of each pixel/point
       # therefore we need to construct variables to store the pixel coordinates, space coordinates respectively.
     b, c ,h, w = src_feat_2d.shape # shape same as ref
+    # ipdb.set_trace()
     with torch.no_grad():
         # 1) ref pixel coords
         y, x = torch.meshgrid([torch.arange(0, h, dtype=torch.float32, device=src_feat_2d.device),
@@ -54,6 +59,8 @@ class CostVolume(nn.Module):
         xy_homo = torch.unsqueeze(xy_homo, 0).repeat(b, 1, 1)  # [B, 3, H*W]
 
         # 2) ref pixel coord -> ref 3D coords: by inverse ref intrinsics & depth
+        # ipdb.set_trace()
+        
         xyz_ray = torch.matmul(torch.inverse(ref_in.detach().clone()), xy_homo) # without depth
         num_depth = depth_values.shape[1]
         ref_3D = xyz_ray.unsqueeze(1).repeat(1, num_depth, 1, 1) * depth_values.view(b, num_depth, 1,
@@ -80,8 +87,10 @@ class CostVolume(nn.Module):
     warped_src_feat_volume = F.grid_sample(src_feat_2d, grid.view(b, num_depth * h, w, 2), mode='bilinear',
                                 padding_mode='zeros')
     warped_src_feat_volume = warped_src_feat_volume.view(b, c, num_depth, h, w)
+    # ipdb.set_trace()
     
     return warped_src_feat_volume
+
 
   def forward(self, depth_values, features_2d, cam_intrinsics, cam_extrinsics):
 
@@ -91,7 +100,7 @@ class CostVolume(nn.Module):
       num_depth = depth_values.shape[1]
       num_views = len(features_2d)
 
-      # 1. differentiable homograhy
+      # 1. differentiable homonograhy
       # 1) ref itself does not acquire any tranformation
       ref_feat_volume = ref_feature.unsqueeze(2).repeat(1, 1, num_depth, 1, 1)
       volume_sum = ref_feat_volume 
@@ -166,14 +175,66 @@ class CostAggregation(nn.Module):
 
     return prob_volume
 
+# 5. Depth Map Refinement
+class RefineNet(nn.Module):
+    def __init__(self):
+        super(RefineNet, self).__init__()
+        self.conv1 = ConvBnReLU(4, 32)
+        self.conv2 = ConvBnReLU(32, 32)
+        self.conv3 = ConvBnReLU(32, 32)
+        self.res = ConvBnReLU(32, 1)
+
+    def forward(self, imgs, depth_inits, depth_values):
+        toP = torchvision.transforms.ToPILImage()
+        toT = torchvision.transforms.ToTensor()
+        img_list = []
+        depth_list = []
+        for img, depth_init, depth_v in zip(imgs, depth_inits, depth_values): 
+            img_save = toP(img)
+            # img_save.save('/mnt/lustre/yslan/meng/MVSNet_pytorch/outputs/original.jpg')
+            n, d_h, d_w = depth_init.shape
+            resized_img = img_save.resize((d_w,d_h), Image.BILINEAR)
+            # resized_img.save('/mnt/lustre/yslan/meng/MVSNet_pytorch/outputs/resized.jpg')
+            # !!IMPORTANT: here is (w, h), not (h, w), BUT img[0] is (h, w), but object Image.size will show (w,h)
+            # !!IMPORTANT_2: the resize() will not change the resized_img it self, so directly save resized_img will save the unresized one
+        
+            # convert back from Image obj to tensor, then concat with depth map
+            # RBG -> [0,1] tensor, consistent with the passed in parameter 'img' (which is also 0-1)
+            img_cat = toT(resized_img) # (w, h) 0~255 -> (3, h, w) 0~1
+            img_list.append(img_cat.unsqueeze(0)) 
+
+            # normalize depth map to 0~1
+            # ipdb.set_trace()
+            depth_normalized = (depth_init-depth_v.min())/(depth_v.max()-depth_v.min())
+            depth_list.append(depth_normalized.unsqueeze(0))
+        
+        imgs_resized = torch.cat(img_list, 0).to(depth_inits.device)
+        depth_inits_normalized = torch.cat(depth_list, 0).to(depth_inits.device)
+        concat = torch.cat((imgs_resized, depth_inits_normalized), dim=1)
+        depth_residual = self.res(self.conv3(self.conv2(self.conv1(concat))))
+        # ipdb.set_trace()
+        # FIXME: depth_residual is not at the same scale as depth_normalized: it can have very large values
+        depth_refined_norm = depth_inits_normalized + depth_residual
+
+        depth_denorm_list = []
+        for depth_norm, depth_v in zip(depth_refined_norm, depth_values):
+            depth_denorm = depth_norm*(depth_v.max()-depth_v.min())+depth_v.min()
+            depth_denorm_list.append(depth_denorm.unsqueeze(0))
+        depth_refined = torch.cat(depth_denorm_list,0).to(depth_inits.device)
+        
+        return depth_refined
+
 
 ########################
 class MVSNet2(nn.Module):
-    def __init__(self, refine=False):
+    def __init__(self, refine=True):
         super(MVSNet2, self).__init__()
         self.feature_extractor = ImageFeatureExtractor() 
         self.cost_vol_builder = CostVolume()
         self.cost_aggregation = CostAggregation()
+        self.refine = refine
+        if self.refine:
+            self.refine_network = RefineNet()
         
     def forward(self, imgs, camera_intrinsics, camera_extrinsics, depth_values):
         '''
@@ -186,26 +247,47 @@ class MVSNet2(nn.Module):
         output:
         depth_map: H x W
         '''
+        # # 0. save src imgs to check data correctness`
+        # toP = torchvision.transforms.ToPILImage()
+        # # os.mkdir('/mnt/lustre/yslan/meng/MVSNet_pytorch/outputs_checkdata', exist_ok=True)
+        # for b, img_b in enumerate(imgs):
+        #     for i, img in enumerate (img_b):
+        #         img_save = toP(img)
+        #         img_save.save('/mnt/lustre/yslan/meng/MVSNet_pytorch/outputs_feb19/bottles_ckpt14_pair_height/outputs_checkdata/{:0>3}_{}_{}.jpg'.format(batch_idx, b, i))
+
         imgs = torch.unbind(imgs, 1)
         cams_in = torch.unbind(camera_intrinsics, 1)
         cams_ex = torch.unbind(camera_extrinsics, 1)
         assert len(imgs) == len(cams_in)==3, "MUST have 3 imgs as in Problem3.8"
+        
+        # ipdb.set_trace()# check depth_values
 
+        
         # 1. basic feature extraction
         features_2d = [self.feature_extractor(img) for img in imgs]
         
         # 2.cost volume building
         cost_volume_by_variance = self.cost_vol_builder(depth_values, features_2d, cams_in, cams_ex)
-    
+        
         # 3. cost volume aggregation & probability map
         prob_volume = self.cost_aggregation(cost_volume_by_variance)  # [B, Ndepth, H, W]
-        # ipdb.set_trace()
+        # 3.1 photometric confidence
+        with torch.no_grad():    
+            prob_volume_sum4 = 4 * F.avg_pool3d(F.pad(prob_volume.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
+            depth_index = torch.arange(depth_values.shape[1], device=prob_volume.device, dtype=torch.float)
+            depth_index = depth_index.unsqueeze(-1).unsqueeze(-1)
+            depth_index = prob_volume*depth_index
+            depth_index = depth_index.sum(1).long()
+            photometric_confidence = torch.gather(prob_volume_sum4, 1, depth_index.unsqueeze(1)).squeeze(1)
+        
         # 4. depth map generation
         depth_values = depth_values.unsqueeze(-1).unsqueeze(-1) # [B, D, 1, 1]
         depth_estimate = prob_volume*depth_values
         depth_map = depth_estimate.sum(1) # sum across all depth
 
-        return {'depth': depth_map}   
+        # 5. Depth Map Refinement
+        if self.refine:
+            refined_depth = self.refine_network(imgs[0], depth_map.unsqueeze(1), depth_values)
+            return {'depth': depth_map, "refined_depth": refined_depth, "photometric_confidence":photometric_confidence}
 
-
-      
+        return {'depth': depth_map, "photometric_confidence":photometric_confidence}   
