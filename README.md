@@ -9,3 +9,10 @@ which includes :
 
 Each module and step has clear comments to explain the operation,
 which can show **my own understanding** of this problem.
+
+If you would like to reproduce results, please run 
+``` bash eval2_bottle.sh ```
+
+The pre-generated result files are stored in **outputs_final**. 
+
+If you have any questions, please feel free to ask :)
